@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -55,23 +56,32 @@ def _resolve_cookie_file() -> str | None:
     Prefers YT_COOKIES_B64 (base64-encoded) — newlines survive any shell
     escaping. Falls back to raw YT_COOKIES. Returns the file path or None
     if no cookies were provided / decoding failed.
+
+    Uses print(stderr) instead of logging because this runs at module
+    import time, before main() calls logging.basicConfig — the default
+    logger swallows INFO/WARNING that early.
     """
+    def diag(msg: str) -> None:
+        print(f"[youtube] {msg}", file=sys.stderr, flush=True)
+
     cookies: str | None = None
     raw_b64 = os.environ.get("YT_COOKIES_B64", "").strip()
+    raw_plain = os.environ.get("YT_COOKIES", "")
+    diag(f"env: YT_COOKIES_B64={len(raw_b64)} chars, YT_COOKIES={len(raw_plain)} chars")
+
     if raw_b64:
         try:
             cookies = base64.b64decode(raw_b64, validate=False).decode("utf-8")
-            log.info("Loaded cookies from YT_COOKIES_B64 (%d bytes decoded)", len(cookies))
-        except (binascii.Error, UnicodeDecodeError):
-            log.exception("YT_COOKIES_B64 set but decode failed")
+            diag(f"decoded YT_COOKIES_B64 → {len(cookies)} bytes")
+        except (binascii.Error, UnicodeDecodeError) as e:
+            diag(f"YT_COOKIES_B64 decode failed: {type(e).__name__}: {e}")
             return None
-    else:
-        raw = os.environ.get("YT_COOKIES", "")
-        if raw.strip():
-            cookies = raw
-            log.info("Loaded cookies from YT_COOKIES (%d bytes raw)", len(cookies))
+    elif raw_plain.strip():
+        cookies = raw_plain
+        diag(f"using raw YT_COOKIES → {len(cookies)} bytes")
 
     if not cookies:
+        diag("no cookies in env, yt-dlp will run unauthenticated")
         return None
 
     if os.name == "nt":
@@ -80,17 +90,14 @@ def _resolve_cookie_file() -> str | None:
         target = Path("/tmp/yt_cookies.txt")
     try:
         target.write_text(cookies, encoding="utf-8")
-    except OSError:
-        log.exception("failed to write cookies to %s", target)
+    except OSError as e:
+        diag(f"failed to write cookies to {target}: {e}")
         return None
 
-    # Sanity check: a valid Netscape cookies.txt has multiple non-comment
-    # lines. If it's a single mashed line (e.g. shell stripped newlines),
-    # log a warning so it's clear from logs why yt-dlp may still get blocked.
     line_count = sum(1 for ln in cookies.splitlines() if ln.strip() and not ln.startswith("#"))
-    log.info("YouTube cookies written to %s (%d cookie lines)", target, line_count)
+    diag(f"cookies written to {target} ({line_count} non-comment lines)")
     if line_count < 5:
-        log.warning("Cookies file has only %d data lines — likely malformed", line_count)
+        diag(f"WARNING: only {line_count} cookie data lines — likely malformed")
     return str(target)
 
 
