@@ -18,19 +18,14 @@ from aiogram.types import (
 )
 
 import cache
-import music
+import vkmusic
 from config import INLINE_CACHE_TIME, INLINE_SEARCH_TIMEOUT, SEARCH_LIMIT_INLINE
 
 from .common import materialize_file_id
-from music import FileTooLargeError
+from vkmusic import FileTooLargeError
 
 router = Router(name="inline")
 log = logging.getLogger(__name__)
-
-# 11-char YouTube id regex — used to decide whether a thumbnail at
-# i.ytimg.com is meaningful. VK ids (e.g. "12345_67890") fail this.
-import re as _re
-_YT_ID_RE = _re.compile(r"^[A-Za-z0-9_-]{11}$")
 
 
 async def _safe_answer(query: InlineQuery, **kwargs) -> None:
@@ -52,7 +47,7 @@ def _format_duration(seconds: int) -> str:
     return f"{m}:{s:02d}"
 
 
-def _make_article(t: music.TrackMeta) -> InlineQueryResultArticle:
+def _make_article(t: vkmusic.TrackMeta) -> InlineQueryResultArticle:
     """Build an Article result for a non-cached track. The Article posts a
     text placeholder; the chosen_inline_result handler later edits it into
     audio via editMessageMedia.
@@ -76,7 +71,7 @@ def _make_article(t: music.TrackMeta) -> InlineQueryResultArticle:
         body += f" — {html.escape(t.performer)}"
     body += "\n⏳ Скачиваю..."
 
-    article_kwargs: dict = dict(
+    return InlineQueryResultArticle(
         id=t.video_id,
         title=t.title or "Unknown",
         description=description,
@@ -87,14 +82,9 @@ def _make_article(t: music.TrackMeta) -> InlineQueryResultArticle:
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="⏳ Загрузка…", callback_data="loading")
         ]]),
+        # No thumbnail — Telegram shows a generic music icon, which is
+        # fine. (VK has no public CDN URL pattern for audio thumbnails.)
     )
-    # Thumbnail is YouTube-specific. For VK ids skip it — Telegram falls
-    # back to a generic music icon, which is fine.
-    if _YT_ID_RE.match(t.video_id):
-        article_kwargs["thumbnail_url"] = f"https://i.ytimg.com/vi/{t.video_id}/mqdefault.jpg"
-        article_kwargs["thumbnail_width"] = 320
-        article_kwargs["thumbnail_height"] = 180
-    return InlineQueryResultArticle(**article_kwargs)
 
 
 @router.inline_query()
@@ -126,11 +116,11 @@ async def on_inline_query(query: InlineQuery, bot: Bot) -> None:
         need = SEARCH_LIMIT_INLINE - len(cached_results)
         try:
             yt_tracks = await asyncio.wait_for(
-                music.search(text, SEARCH_LIMIT_INLINE),
+                vkmusic.search(text, SEARCH_LIMIT_INLINE),
                 timeout=INLINE_SEARCH_TIMEOUT,
             )
         except asyncio.TimeoutError:
-            log.info("music.search timed out for %r", text)
+            log.info("vkmusic.search timed out for %r", text)
             yt_tracks = []
         for t in yt_tracks:
             if t.video_id in cached_ids:

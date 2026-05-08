@@ -59,7 +59,19 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 4. Настроить `.env`
+### 4. Получить VK-токен
+
+Бот ищет и качает музыку через VK Music. Нужен токен с правами `audio`. Тут есть подвох: **обычные токены с vkhost.github.io (implicit OAuth flow) НЕ работают** — VK в 2025 заблокировал им доступ к `audio.search` (отвечает `error 3: Unknown method passed`). Нужен токен через **direct-auth flow** (Kate Mobile client_id + client_secret).
+
+В репе лежит helper-скрипт, который это делает:
+
+```bash
+python scripts/get_vk_audio_token.py
+```
+
+Он спросит логин (телефон/email), пароль, при необходимости SMS-код для 2FA, ничего никуда не отправляет кроме `oauth.vk.com/token`, и в конце выводит токен. Используй **левый/тестовый VK-аккаунт** — токен это полный доступ к аудио и подпискам этого аккаунта.
+
+### 5. Настроить `.env`
 
 ```bash
 cp .env.example .env
@@ -70,9 +82,10 @@ cp .env.example .env
 ```
 BOT_TOKEN=123456:ABC...           # токен из BotFather
 STORAGE_CHAT_ID=-1001234567890    # ID канала-хранилища (см. шаг 2)
+VK_TOKEN=vk1.a.XXXXX...           # токен из шага 4
 ```
 
-### 5. Запустить
+### 6. Запустить
 
 ```bash
 python bot.py
@@ -99,17 +112,19 @@ python bot.py
 
 ## Архитектура
 
-- `bot.py` — точка входа, polling.
-- `youtube.py` — обёртка над `yt-dlp` (поиск + скачивание).
-- `cache.py` — SQLite-кэш `video_id → file_id`.
-- `handlers/inline.py` — `inline_query` (гибрид кэш+YouTube-поиск, Article-плейсхолдеры) и `chosen_inline_result` (фоновое скачивание + `editMessageMedia` → подмена текста на аудио).
+- `bot.py` — точка входа, polling + health-эндпоинт для PaaS.
+- `vkmusic.py` — поиск/скачивание через **VK Music** (api.vk.com/audio.search + audio.getById, Kate Mobile UA + direct-auth токен). ffmpeg обёртывает любой URL (mp3/HLS) в m4a.
+- `cache.py` — SQLite-кэш `video_id → file_id` (где `video_id` = `{owner_id}_{audio_id}` от VK).
+- `handlers/inline.py` — `inline_query` (кэш + VK-поиск, Article-плейсхолдеры) и `chosen_inline_result` (фоновое скачивание + `editMessageMedia` → подмена текста на аудио).
 - `handlers/messages.py` — `/start dl_<id>`, текстовый поиск в ЛС.
 - `handlers/callbacks.py` — кнопки в ЛС (`pick:<id>`) и заглушка для кнопки-индикатора.
 - `handlers/common.py` — `materialize_file_id`: единый путь «гарантировать наличие `file_id` для `video_id`» (cache-or-download-or-upload-to-storage), используется и DM, и inline.
 - `handlers/_dedup.py` — single-flight: одновременные запросы одного `video_id` ждут одного скачивания.
+- `scripts/get_vk_audio_token.py` — helper для получения рабочего VK-токена через direct-auth flow (вместо отвалившегося implicit flow с vkhost.github.io).
 
 ## Ограничения
 
 - **Лимит размера файла — 50 MB** (ограничение обычных Telegram-ботов). Очень длинные треки/миксы не пройдут.
-- **Только YouTube** в качестве источника. VK / SoundCloud в планах.
+- **Только VK** в качестве источника. Каталог большой (мейнстрим + русская сцена), но не всё что есть на YouTube есть в VK.
+- **VK-токен — это твой VK-аккаунт.** Используй левый/тестовый аккаунт. Токен не expire'ится автоматически но может быть отозван если VK заметит подозрительную активность.
 - **Никакой авторизации/whitelist.** Если бот публичный, любой может им пользоваться.

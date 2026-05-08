@@ -32,8 +32,6 @@ else:
     STORAGE_CHAT_ID = _DEFAULT_STORAGE_CHAT_ID
 
 VK_TOKEN = os.getenv("VK_TOKEN", "").strip()
-# Optional: set to "1" to disable the YouTube/yt-dlp fallback path entirely.
-DISABLE_YOUTUBE_FALLBACK = os.getenv("DISABLE_YOUTUBE_FALLBACK", "").strip() in ("1", "true", "yes")
 
 MAX_AUDIO_BYTES = 49 * 1024 * 1024
 SEARCH_LIMIT_DM = 5

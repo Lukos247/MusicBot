@@ -7,9 +7,9 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import FSInputFile, Message
 
 import cache
-import music
+import vkmusic
 from config import STORAGE_CHAT_ID
-from music import FileTooLargeError
+from vkmusic import FileTooLargeError
 
 from . import _dedup as dedup
 
@@ -43,15 +43,15 @@ async def _safe_delete(msg: Message) -> None:
 async def materialize_file_id(bot: Bot, video_id: str) -> cache.CachedTrack | None:
     """Ensure that a Telegram file_id exists in the cache for video_id.
 
-    On cache hit returns the CachedTrack. On miss: downloads via yt-dlp,
-    uploads to STORAGE_CHAT_ID to obtain a bot-scoped file_id, saves to
-    the cache, and returns the freshly cached entry.
+    On cache hit returns the CachedTrack. On miss: downloads via VK
+    Music + ffmpeg, uploads to STORAGE_CHAT_ID to obtain a bot-scoped
+    file_id, saves to the cache, and returns the freshly cached entry.
 
     Concurrent calls for the same video_id are deduplicated through
     handlers._dedup so only one download/upload happens.
 
     Raises FileTooLargeError if the audio exceeds the bot upload limit.
-    Returns None for other failures (network, yt-dlp, upload).
+    Returns None for other failures (network, VK API, upload).
     """
     cached = await cache.get(video_id)
     if cached is not None:
@@ -63,11 +63,11 @@ async def materialize_file_id(bot: Bot, video_id: str) -> cache.CachedTrack | No
 
     try:
         try:
-            track = await music.download(video_id)
+            track = await vkmusic.download(video_id)
         except FileTooLargeError:
             raise
         except Exception:
-            log.exception("yt-dlp download failed for %s", video_id)
+            log.exception("vkmusic download failed for %s", video_id)
             return None
 
         try:
@@ -80,12 +80,12 @@ async def materialize_file_id(bot: Bot, video_id: str) -> cache.CachedTrack | No
             )
         except Exception:
             log.exception("upload to STORAGE_CHAT_ID failed for %s", video_id)
-            music.cleanup(track.path)
+            vkmusic.cleanup(track.path)
             return None
 
         if sent.audio is None:
             log.warning("STORAGE_CHAT_ID upload for %s returned no audio object", video_id)
-            music.cleanup(track.path)
+            vkmusic.cleanup(track.path)
             return None
 
         await cache.save(
@@ -95,7 +95,7 @@ async def materialize_file_id(bot: Bot, video_id: str) -> cache.CachedTrack | No
             track.performer,
             track.duration,
         )
-        music.cleanup(track.path)
+        vkmusic.cleanup(track.path)
         return await cache.get(video_id)
     finally:
         dedup.release(video_id, ev)

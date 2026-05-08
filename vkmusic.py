@@ -1,19 +1,20 @@
-"""VK Music as a primary audio source.
+"""VK Music — the bot's only audio source.
 
-Public surface mirrors `youtube.py` (TrackMeta, DownloadedTrack, search,
-download, cleanup, FileTooLargeError) — handlers and music.py treat
-both modules interchangeably.
-
-video_id format: VK's standard "{owner_id}_{audio_id}" — e.g. "12345_67890"
-or "-2000000000_67890" for groups. Stable across re-fetches.
+video_id format: VK's canonical "{owner_id}_{audio_id}" string —
+e.g. "12345_67890" or "-2000000000_67890" for groups. Stable across
+re-fetches and fits the existing SQLite cache (TEXT primary key).
 
 Networking:
-- Direct calls to api.vk.com (NOT the m.vk.com web scraping path that
-  vk_api.audio.VkAudio uses — that path crashes with IndexError on a
-  token-only auth because it expects a full browser session).
-- A Kate Mobile User-Agent + Kate-flow access token unlocks the
-  `audio.search` / `audio.getById` API methods that VK normally
-  restricts. Token via vkhost.github.io → Kate Mobile.
+- Direct calls to https://api.vk.com/method (NOT the m.vk.com web
+  scraping that vk_api.audio.VkAudio does — that path crashes with
+  IndexError on a token-only auth).
+- The token MUST come from the direct-authorization flow
+  (oauth.vk.com/token, grant_type=password, Kate Mobile client_id +
+  client_secret). Implicit-flow tokens from vkhost.github.io get
+  rejected with `error 3: Unknown method passed` on audio.search
+  since VK's mid-2025 tightening — see scripts/get_vk_audio_token.py.
+- The Kate Mobile User-Agent must accompany every request — VK uses
+  it as a signal that the call is allowed to reach the audio API.
 - ffmpeg downloads the resulting URL (mp3 or HLS m3u8 — both work).
 """
 
@@ -24,6 +25,7 @@ import logging
 import re
 import subprocess
 import sys
+from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
 from typing import Any
@@ -31,12 +33,36 @@ from typing import Any
 import requests
 
 from config import DOWNLOADS_DIR, MAX_AUDIO_BYTES, VK_TOKEN
-# Reuse canonical types so handlers and the source router don't have to
-# discriminate. FileTooLargeError must be a single class for the
-# `except FileTooLargeError` clauses in handlers/common.py.
-from youtube import DownloadedTrack, FileTooLargeError, TrackMeta
 
 log = logging.getLogger(__name__)
+
+
+class FileTooLargeError(Exception):
+    """Raised when the downloaded audio exceeds the bot's upload limit
+    (Telegram caps regular bots at 50 MB)."""
+
+    def __init__(self, size: int) -> None:
+        super().__init__(f"File too large: {size} bytes")
+        self.size = size
+
+
+@dataclass(slots=True)
+class TrackMeta:
+    """Search-result metadata. video_id is VK's canonical
+    "{owner_id}_{audio_id}" string."""
+
+    video_id: str
+    title: str
+    performer: str
+    duration: int
+
+
+@dataclass(slots=True)
+class DownloadedTrack:
+    path: Path
+    title: str
+    performer: str
+    duration: int
 
 _VK_API_BASE = "https://api.vk.com/method"
 _VK_API_VERSION = "5.131"
