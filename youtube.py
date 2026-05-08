@@ -44,10 +44,19 @@ if _FFMPEG_DIR:
 
 
 # Datacenter IPs (Fly, Render, Railway, ...) often trip YouTube's "confirm
-# you're not a bot" challenge against the default `web` player client. Pin
-# yt-dlp to mobile clients which still go through. `tv` is intentionally
-# excluded — it returns truncated format lists that miss audio-only streams.
-_YT_PLAYER_CLIENTS = ["default", "android", "ios"]
+# you're not a bot" challenge against the default `web` player client.
+# `mweb` (mobile web) and `web_safari` route through different YouTube
+# backends that are noticeably more lenient on datacenter IPs even when
+# cookies are presented. Mobile clients (android/ios) are the next
+# fallback. `tv` is excluded — it returns truncated format lists.
+_YT_PLAYER_CLIENTS = ["mweb", "web_safari", "android", "ios"]
+
+# A real browser User-Agent paired with the cookies makes the request
+# look less synthetic to YouTube's bot heuristics.
+_YT_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
+)
 
 
 def _resolve_cookie_file() -> str | None:
@@ -148,6 +157,7 @@ def _search_blocking(query: str, limit: int) -> list[TrackMeta]:
         "noplaylist": True,
         "socket_timeout": 10,
         "extractor_args": {"youtube": {"player_client": _YT_PLAYER_CLIENTS}},
+        "http_headers": {"User-Agent": _YT_USER_AGENT},
     }
     if _YT_COOKIE_FILE:
         opts["cookiefile"] = _YT_COOKIE_FILE
