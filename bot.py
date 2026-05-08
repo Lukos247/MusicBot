@@ -41,14 +41,16 @@ async def main() -> None:
 
     await cache.init_db()
 
+    # Start the health server first so the platform proxy has something to
+    # connect to before we make any outbound calls (bot.get_me() etc.).
+    health_runner = await _run_health_server()
+
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(build_router())
 
     me = await bot.get_me()
     logging.info("Bot started @%s (id=%s)", me.username, me.id)
-
-    health_runner = await _run_health_server()
 
     try:
         await bot.delete_webhook(drop_pending_updates=True)
