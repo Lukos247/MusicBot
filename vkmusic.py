@@ -1,19 +1,20 @@
 """VK Music as a primary audio source.
 
-Mirrors the public surface of `youtube.py` (TrackMeta, DownloadedTrack,
-search, download, cleanup, FileTooLargeError) so handlers can call either
-module interchangeably.
+Public surface mirrors `youtube.py` (TrackMeta, DownloadedTrack, search,
+download, cleanup, FileTooLargeError) — handlers and music.py treat
+both modules interchangeably.
 
-The video_id field uses VK's standard "{owner_id}_{audio_id}" identifier
-(owner_id is negative for groups). This is stable across re-fetches and
-fits cleanly into the existing SQLite cache (TEXT primary key).
+video_id format: VK's standard "{owner_id}_{audio_id}" — e.g. "12345_67890"
+or "-2000000000_67890" for groups. Stable across re-fetches.
 
-Networking notes:
-- vk_api.audio.VkAudio scrapes m.vk.com under the hood — the public VK
-  API removed audio endpoints in 2017. We pass a Kate-Mobile-style token
-  obtained via vkhost.github.io.
-- Some tracks are served as HLS m3u8; vk_api converts those to direct
-  mp3 URLs by default. ffmpeg handles both transparently anyway.
+Networking:
+- Direct calls to api.vk.com (NOT the m.vk.com web scraping path that
+  vk_api.audio.VkAudio uses — that path crashes with IndexError on a
+  token-only auth because it expects a full browser session).
+- A Kate Mobile User-Agent + Kate-flow access token unlocks the
+  `audio.search` / `audio.getById` API methods that VK normally
+  restricts. Token via vkhost.github.io → Kate Mobile.
+- ffmpeg downloads the resulting URL (mp3 or HLS m3u8 — both work).
 """
 
 from __future__ import annotations
@@ -22,40 +23,68 @@ import asyncio
 import logging
 import re
 import subprocess
+import sys
 from itertools import islice
 from pathlib import Path
+from typing import Any
 
-import vk_api
-from vk_api.audio import VkAudio
+import requests
 
 from config import DOWNLOADS_DIR, MAX_AUDIO_BYTES, VK_TOKEN
-# Reuse the canonical types from youtube.py so handlers and the source
-# router don't have to distinguish — TrackMeta/DownloadedTrack are a
-# common shape, and FileTooLargeError must be a single class for the
-# `except FileTooLargeError` clauses in handlers/common.py to catch both.
+# Reuse canonical types so handlers and the source router don't have to
+# discriminate. FileTooLargeError must be a single class for the
+# `except FileTooLargeError` clauses in handlers/common.py.
 from youtube import DownloadedTrack, FileTooLargeError, TrackMeta
 
 log = logging.getLogger(__name__)
 
+_VK_API_BASE = "https://api.vk.com/method"
+_VK_API_VERSION = "5.131"
+# Kate Mobile UA — pairs with the Kate-Mobile-flow token to get audio API access.
+_VK_UA = (
+    "KateMobileAndroid/56 lite-460 (Android 4.4.2; SDK 19; "
+    "x86; unknown Android SDK built for x86; en)"
+)
 
-_session: vk_api.VkApi | None = None
-_audio: VkAudio | None = None
+
+def _diag(msg: str) -> None:
+    """Module-import-time visibility — log.* may be swallowed before
+    main() runs basicConfig."""
+    print(f"[vkmusic] {msg}", file=sys.stderr, flush=True)
 
 
-def _get_audio() -> VkAudio | None:
-    """Lazy-init the VkAudio scraper. Returns None if VK_TOKEN is not set."""
-    global _session, _audio
+def is_configured() -> bool:
+    return bool(VK_TOKEN)
+
+
+def _vk_call(method: str, **params: Any) -> dict | None:
+    """Synchronous VK API call. Returns the `response` dict on success,
+    None on error (already logged)."""
     if not VK_TOKEN:
         return None
-    if _audio is None:
-        try:
-            _session = vk_api.VkApi(token=VK_TOKEN)
-            _audio = VkAudio(_session)
-            log.info("VkAudio initialised, user_id=%s", _audio.user_id)
-        except Exception:
-            log.exception("VkAudio initialisation failed — VK_TOKEN invalid?")
-            _audio = None
-    return _audio
+    full_params = dict(params)
+    full_params["access_token"] = VK_TOKEN
+    full_params["v"] = _VK_API_VERSION
+    try:
+        resp = requests.get(
+            f"{_VK_API_BASE}/{method}",
+            params=full_params,
+            headers={"User-Agent": _VK_UA},
+            timeout=10,
+        )
+    except requests.RequestException as e:
+        log.warning("VK %s network error: %s", method, e)
+        return None
+    try:
+        data = resp.json()
+    except ValueError:
+        log.warning("VK %s returned non-JSON: %s", method, resp.text[:200])
+        return None
+    if "error" in data:
+        err = data["error"]
+        log.warning("VK %s API error %s: %s", method, err.get("error_code"), err.get("error_msg"))
+        return None
+    return data.get("response")
 
 
 def _to_track_meta(item: dict) -> TrackMeta:
@@ -68,15 +97,12 @@ def _to_track_meta(item: dict) -> TrackMeta:
 
 
 def _search_blocking(query: str, limit: int) -> list[TrackMeta]:
-    audio = _get_audio()
-    if audio is None:
+    response = _vk_call("audio.search", q=query, count=limit, auto_complete=1)
+    if response is None:
         return []
-    try:
-        # search() returns an islice iterator; cap explicitly
-        return [_to_track_meta(item) for item in islice(audio.search(q=query, count=limit), limit)]
-    except Exception:
-        log.exception("VK audio search failed for %r", query)
-        return []
+    items = response.get("items") or []
+    log.info("VK audio.search %r → %d items", query, len(items))
+    return [_to_track_meta(item) for item in islice(items, limit)]
 
 
 async def search(query: str, limit: int) -> list[TrackMeta]:
@@ -96,31 +122,31 @@ def _parse_video_id(video_id: str) -> tuple[int, int] | None:
     return int(m.group(1)), int(m.group(2))
 
 
-def _safe_filename_part(text: str) -> str:
-    cleaned = "".join(c for c in text if c.isalnum() or c in " -_().,'").strip()
-    return cleaned[:50]
+def _fetch_audio(owner_id: int, audio_id: int) -> dict | None:
+    """audio.getById refreshes URL — VK URLs expire after a few hours."""
+    response = _vk_call("audio.getById", audios=f"{owner_id}_{audio_id}")
+    if response is None:
+        return None
+    if isinstance(response, list):
+        return response[0] if response else None
+    return response
 
 
 def _download_blocking(video_id: str) -> DownloadedTrack:
-    audio = _get_audio()
-    if audio is None:
-        raise RuntimeError("VK_TOKEN not configured")
-
     parsed = _parse_video_id(video_id)
     if parsed is None:
         raise RuntimeError(f"Bad VK audio id: {video_id!r}")
     owner_id, audio_id = parsed
 
-    # Re-fetch to get a fresh signed URL — VK URLs expire after a few hours.
-    item = audio.get_audio_by_id(owner_id, audio_id)
-    if not item or isinstance(item, list) and not item:
+    item = _fetch_audio(owner_id, audio_id)
+    if not item:
         raise RuntimeError(f"VK audio not found: {video_id}")
-    if isinstance(item, list):
-        item = item[0]
 
     url = item.get("url")
     if not url:
-        # Some tracks have no playable URL (DRM / region-locked / removed).
+        # Some tracks don't expose a URL even with Kate token (DRM /
+        # geo-restricted / removed). Caller will surface this as a generic
+        # download-failed message to the user.
         raise RuntimeError(f"VK audio has no playable URL: {video_id}")
 
     title = (item.get("title") or "").strip() or "Unknown"
@@ -134,8 +160,6 @@ def _download_blocking(video_id: str) -> DownloadedTrack:
         except OSError:
             pass
 
-    # ffmpeg reads both direct mp3 and HLS m3u8 transparently.
-    # -vn drops any video track, -c:a aac transcodes to AAC m4a.
     cmd = [
         "ffmpeg",
         "-y",
@@ -185,6 +209,10 @@ def cleanup(path: Path) -> None:
         log.warning("Failed to remove file %s", path)
 
 
-def is_configured() -> bool:
-    """Whether VK_TOKEN is set. Use to decide if VK should be tried."""
-    return bool(VK_TOKEN)
+# Module-load smoke test — confirms token presence and emits a hint that
+# audio.search will be tried. Actual API call happens lazily on first
+# search to avoid blocking startup on a slow VK request.
+if VK_TOKEN:
+    _diag(f"VK_TOKEN present ({len(VK_TOKEN)} chars), audio.search ready")
+else:
+    _diag("VK_TOKEN absent, vkmusic disabled")
