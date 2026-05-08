@@ -39,6 +39,32 @@ _FFMPEG_DIR = _resolve_ffmpeg_dir()
 if _FFMPEG_DIR:
     log.info("Using bundled ffmpeg from %s", _FFMPEG_DIR)
 
+
+# Datacenter IPs (Fly, Render, Railway, ...) often trip YouTube's "confirm
+# you're not a bot" challenge against the default `web` player client. Pin
+# yt-dlp to mobile/tv clients which still go through.
+_YT_PLAYER_CLIENTS = ["default", "android", "ios", "tv"]
+
+
+def _resolve_cookie_file() -> str | None:
+    """If YT_COOKIES env var is set with the contents of a Netscape-format
+    cookies.txt, drop it on disk so yt-dlp can read it. Returns the path or
+    None if no cookies were provided."""
+    raw = os.environ.get("YT_COOKIES", "")
+    if not raw.strip():
+        return None
+    target = Path("/tmp/yt_cookies.txt") if os.name != "nt" else Path(os.environ.get("TEMP", ".")) / "yt_cookies.txt"
+    try:
+        target.write_text(raw, encoding="utf-8")
+    except OSError:
+        log.exception("failed to write YT_COOKIES to %s", target)
+        return None
+    log.info("Using YouTube cookies from YT_COOKIES env var (%s)", target)
+    return str(target)
+
+
+_YT_COOKIE_FILE = _resolve_cookie_file()
+
 _TITLE_NOISE = re.compile(
     r"\s*[\(\[]\s*(official\s*(music\s*)?video|official\s*audio|lyrics?|"
     r"audio|video|hd|4k|m/v|mv|live|remastered|visualizer)\s*[\)\]]\s*",
@@ -83,7 +109,10 @@ def _search_blocking(query: str, limit: int) -> list[TrackMeta]:
         "default_search": f"ytsearch{limit}",
         "noplaylist": True,
         "socket_timeout": 10,
+        "extractor_args": {"youtube": {"player_client": _YT_PLAYER_CLIENTS}},
     }
+    if _YT_COOKIE_FILE:
+        opts["cookiefile"] = _YT_COOKIE_FILE
     results: list[TrackMeta] = []
     try:
         with YoutubeDL(opts) as ydl:
@@ -142,9 +171,12 @@ def _download_blocking(video_id: str) -> DownloadedTrack:
             }
         ],
         "prefer_ffmpeg": True,
+        "extractor_args": {"youtube": {"player_client": _YT_PLAYER_CLIENTS}},
     }
     if _FFMPEG_DIR:
         opts["ffmpeg_location"] = _FFMPEG_DIR
+    if _YT_COOKIE_FILE:
+        opts["cookiefile"] = _YT_COOKIE_FILE
     url = f"https://www.youtube.com/watch?v={video_id}"
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
