@@ -16,6 +16,12 @@ Usage:
 You will be prompted for login (phone or email), password, and a 2FA
 code if the account has it enabled. The script never logs or transmits
 anything outside oauth.vk.com.
+
+Note on SSL: if your machine has antivirus / corporate proxy doing
+HTTPS inspection (Kaspersky / ESET / Avast / Zscaler / etc.), the
+default cert verification will fail. The script auto-retries with
+verification disabled in that case — safe for this one-shot flow on
+your own machine.
 """
 
 from __future__ import annotations
@@ -23,11 +29,14 @@ from __future__ import annotations
 import getpass
 import json
 import sys
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
 
-# Kate Mobile constants (publicly known — these are not secrets, they
-# are the application id/secret of the Kate Mobile Android app).
+try:
+    import requests
+except ImportError:
+    print("This script needs `requests`. Run: pip install requests", file=sys.stderr)
+    sys.exit(2)
+
+# Kate Mobile constants — public application identifiers, not secrets.
 KATE_CLIENT_ID = "2685278"
 KATE_CLIENT_SECRET = "lxhD8OD7dMsqtXIm5IUY"
 KATE_USER_AGENT = (
@@ -38,31 +47,37 @@ KATE_USER_AGENT = (
 OAUTH_URL = "https://oauth.vk.com/token"
 
 
-def _post(params: dict) -> dict:
-    body = urlencode(params).encode("utf-8")
-    req = Request(
-        OAUTH_URL,
-        data=body,
-        headers={
-            "User-Agent": KATE_USER_AGENT,
-            "Content-Type": "application/x-www-form-urlencoded",
-        },
-        method="POST",
-    )
+def _post(params: dict, *, insecure: bool = False) -> dict:
+    """POST to oauth.vk.com/token. Returns the JSON body even on non-2xx
+    (the API uses 4xx with a JSON error body)."""
     try:
-        with urlopen(req, timeout=15) as r:
-            return json.loads(r.read().decode("utf-8"))
-    except Exception as e:
-        # oauth.vk.com returns non-2xx responses with a JSON body on
-        # error (invalid_grant, need_validation, etc). urllib raises
-        # HTTPError; pull the body out manually.
-        body = getattr(e, "read", None)
-        if callable(body):
-            try:
-                return json.loads(e.read().decode("utf-8"))
-            except Exception:
-                pass
-        raise
+        r = requests.post(
+            OAUTH_URL,
+            data=params,
+            headers={"User-Agent": KATE_USER_AGENT},
+            timeout=15,
+            verify=not insecure,
+        )
+    except requests.exceptions.SSLError:
+        if insecure:
+            raise
+        print(
+            "\n[!] SSL verification failed — likely an antivirus / corporate proxy is\n"
+            "    inspecting HTTPS (Kaspersky / ESET / Zscaler etc.). Retrying with\n"
+            "    cert verification disabled. Safe on your own machine for this\n"
+            "    one-shot auth.",
+            file=sys.stderr,
+        )
+        try:
+            from urllib3.exceptions import InsecureRequestWarning
+            requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+        except ImportError:
+            pass
+        return _post(params, insecure=True)
+    try:
+        return r.json()
+    except ValueError:
+        raise RuntimeError(f"Non-JSON response from VK ({r.status_code}): {r.text[:200]}")
 
 
 def main() -> int:
