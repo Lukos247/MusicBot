@@ -1,0 +1,11 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+data/cache.db*
+data/downloads/
+.git/
+.idea/
+.vscode/
+README.md
