@@ -42,8 +42,9 @@ if _FFMPEG_DIR:
 
 # Datacenter IPs (Fly, Render, Railway, ...) often trip YouTube's "confirm
 # you're not a bot" challenge against the default `web` player client. Pin
-# yt-dlp to mobile/tv clients which still go through.
-_YT_PLAYER_CLIENTS = ["default", "android", "ios", "tv"]
+# yt-dlp to mobile clients which still go through. `tv` is intentionally
+# excluded — it returns truncated format lists that miss audio-only streams.
+_YT_PLAYER_CLIENTS = ["default", "android", "ios"]
 
 
 def _resolve_cookie_file() -> str | None:
@@ -158,7 +159,9 @@ def _download_blocking(video_id: str) -> DownloadedTrack:
     opts = {
         "quiet": True,
         "no_warnings": True,
-        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        # Lenient: take any best audio (or fall back to combined). The
+        # FFmpegExtractAudio postprocessor below converts to m4a regardless.
+        "format": "bestaudio/best",
         "outtmpl": out_template,
         "noplaylist": True,
         "socket_timeout": 30,
