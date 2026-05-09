@@ -198,6 +198,46 @@ def _build_audio_scraper():
                 f"cookies {cookies_before} → {len(http.cookies)}, "
                 f"history={[h.status_code for h in bridge.history]}"
             )
+            # The bridge often parks us at m.vk.com/login?role=fast — a
+            # confirmation form whose <form> the browser auto-submits.
+            # Drive that form ourselves so the m.vk.com session cookie
+            # actually lands.
+            if ("/login" in bridge.url and ("role=fast" in bridge.url or "slogin_h" in bridge.url)):
+                try:
+                    from bs4 import BeautifulSoup
+                except ImportError:
+                    _diag("warmup: bs4 missing, can't auto-submit fast-login form")
+                else:
+                    soup = BeautifulSoup(bridge.text or "", "html.parser")
+                    form = soup.find("form")
+                    if form:
+                        action = form.get("action") or bridge.url
+                        if action.startswith("/"):
+                            action = "https://m.vk.com" + action
+                        elif not action.startswith("http"):
+                            action = "https://m.vk.com/" + action
+                        method = (form.get("method") or "post").lower()
+                        inputs = {
+                            i.get("name"): i.get("value") or ""
+                            for i in form.find_all("input")
+                            if i.get("name")
+                        }
+                        _diag(
+                            f"warmup: submitting fast-login form "
+                            f"({method.upper()} {action[:80]}…, {len(inputs)} fields)"
+                        )
+                        if method == "post":
+                            confirm = http.post(action, data=inputs, timeout=15, allow_redirects=True)
+                        else:
+                            confirm = http.get(action, params=inputs, timeout=15, allow_redirects=True)
+                        _diag(
+                            f"warmup confirm: status={confirm.status_code}, "
+                            f"final_url={confirm.url}, "
+                            f"cookies → {len(http.cookies)}, "
+                            f"history={[h.status_code for h in confirm.history]}"
+                        )
+                    else:
+                        _diag("warmup: fast-login page has no <form> to submit")
         else:
             _diag(
                 f"warmup: m.vk.com responded directly (status={probe.status_code}, "
