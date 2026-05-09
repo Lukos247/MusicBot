@@ -1,26 +1,29 @@
-"""VK Music — the bot's only audio source.
+"""VK Music — the bot's audio source.
 
-video_id format: VK's canonical "{owner_id}_{audio_id}" string —
-e.g. "12345_67890" or "-2000000000_67890" for groups. Stable across
-re-fetches and fits the existing SQLite cache (TEXT primary key).
+Two auth paths are supported, picked at startup:
 
-Networking:
-- Direct calls to https://api.vk.com/method (NOT the m.vk.com web
-  scraping that vk_api.audio.VkAudio does — that path crashes with
-  IndexError on a token-only auth).
-- The token MUST come from the direct-authorization flow
-  (oauth.vk.com/token, grant_type=password, Kate Mobile client_id +
-  client_secret). Implicit-flow tokens from vkhost.github.io get
-  rejected with `error 3: Unknown method passed` on audio.search
-  since VK's mid-2025 tightening — see scripts/get_vk_audio_token.py.
-- The Kate Mobile User-Agent must accompany every request — VK uses
-  it as a signal that the call is allowed to reach the audio API.
-- ffmpeg downloads the resulting URL (mp3 or HLS m3u8 — both work).
+1. **Browser cookies** (preferred — bypasses password flow entirely).
+   Set `VK_COOKIES_B64` + `VK_USER_ID`. The bot loads the cookies into
+   a requests session, sets a browser User-Agent, and scrapes
+   m.vk.com/audio via vk_api.audio.VkAudio. Works as long as the
+   cookies are still valid in the browser they were exported from
+   (typically weeks). Doesn't trigger VK's password-bruteforce flood
+   control.
+
+2. **Direct-auth Kate Mobile token** (legacy, often blocked by flood
+   control). Set `VK_TOKEN`. Used only if cookies aren't configured.
+   Talks to api.vk.com/method/audio.search directly. Token must come
+   from `oauth.vk.com/token` (grant_type=password) — implicit-flow
+   tokens from vkhost.github.io are rejected with `error 3`.
+
+video_id format: VK's canonical `{owner_id}_{audio_id}` string —
+e.g. `12345_67890` or `-2000000000_67890` for groups.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import re
 import subprocess
@@ -32,15 +35,12 @@ from typing import Any
 
 import requests
 
-from config import DOWNLOADS_DIR, MAX_AUDIO_BYTES, VK_TOKEN
+from config import DOWNLOADS_DIR, MAX_AUDIO_BYTES, VK_TOKEN, VK_COOKIES_B64, VK_USER_ID
 
 log = logging.getLogger(__name__)
 
 
 class FileTooLargeError(Exception):
-    """Raised when the downloaded audio exceeds the bot's upload limit
-    (Telegram caps regular bots at 50 MB)."""
-
     def __init__(self, size: int) -> None:
         super().__init__(f"File too large: {size} bytes")
         self.size = size
@@ -48,9 +48,6 @@ class FileTooLargeError(Exception):
 
 @dataclass(slots=True)
 class TrackMeta:
-    """Search-result metadata. video_id is VK's canonical
-    "{owner_id}_{audio_id}" string."""
-
     video_id: str
     title: str
     performer: str
@@ -64,12 +61,19 @@ class DownloadedTrack:
     performer: str
     duration: int
 
+
 _VK_API_BASE = "https://api.vk.com/method"
 _VK_API_VERSION = "5.131"
-# Kate Mobile UA — pairs with the Kate-Mobile-flow token to get audio API access.
-_VK_UA = (
+_KATE_UA = (
     "KateMobileAndroid/56 lite-460 (Android 4.4.2; SDK 19; "
     "x86; unknown Android SDK built for x86; en)"
+)
+# Browser UA paired with browser-exported cookies — m.vk.com checks UA
+# against the session and gives different responses for "looks like a
+# bot vs. browser".
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
 )
 
 
@@ -79,13 +83,92 @@ def _diag(msg: str) -> None:
     print(f"[vkmusic] {msg}", file=sys.stderr, flush=True)
 
 
-def is_configured() -> bool:
-    return bool(VK_TOKEN)
+# ---------------------------------------------------------------------------
+# Cookies path: m.vk.com scraping via vk_api.audio.VkAudio
+# ---------------------------------------------------------------------------
+
+_audio_scraper = None  # vk_api.audio.VkAudio instance, or None
+
+
+def _parse_netscape_cookies(text: str) -> dict[str, str]:
+    """Minimal Netscape cookies.txt parser — returns name→value for
+    cookies on .vk.com / vk.com / m.vk.com domains."""
+    out: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 7:
+            continue
+        domain, _flag, _path, _secure, _exp, name, value = parts[:7]
+        if "vk.com" in domain:
+            out[name] = value
+    return out
+
+
+def _build_audio_scraper():
+    """Construct a vk_api.audio.VkAudio that uses an authenticated session
+    derived from the user's browser cookies. Returns None on failure."""
+    if not (VK_COOKIES_B64 and VK_USER_ID):
+        return None
+    try:
+        import vk_api
+        from vk_api.audio import VkAudio
+    except ImportError:
+        _diag("vk_api / beautifulsoup4 not installed — cookies path disabled")
+        return None
+    try:
+        cookies_text = base64.b64decode(VK_COOKIES_B64).decode("utf-8")
+    except Exception as e:
+        _diag(f"VK_COOKIES_B64 decode failed: {e}")
+        return None
+    cookies = _parse_netscape_cookies(cookies_text)
+    if not cookies:
+        _diag("no .vk.com cookies parsed from VK_COOKIES_B64")
+        return None
+    try:
+        user_id = int(VK_USER_ID)
+    except ValueError:
+        _diag(f"VK_USER_ID not a valid integer: {VK_USER_ID!r}")
+        return None
+
+    # Build a requests session with the cookies + a browser UA. m.vk.com
+    # will treat it as the original logged-in browser.
+    http = requests.Session()
+    for name, value in cookies.items():
+        http.cookies.set(name, value, domain=".vk.com", path="/")
+    http.headers.update({
+        "User-Agent": _BROWSER_UA,
+        "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+    })
+
+    # vk_api.VkApi normally needs login/password or a token. We bypass
+    # __init__'s auth entirely by setting attrs manually — VkAudio only
+    # uses self._vk.http for its m.vk.com requests, never the API token.
+    session = vk_api.VkApi.__new__(vk_api.VkApi)
+    session.http = http
+    session.token = None
+    session.lock = None  # not used by VkAudio
+    session.api_version = _VK_API_VERSION
+
+    audio = VkAudio.__new__(VkAudio)
+    audio._vk = session
+    audio.user_id = user_id
+    audio.convert_m3u8_links = True
+    _diag(
+        f"VkAudio (cookies path) initialised: {len(cookies)} cookies, "
+        f"user_id={user_id}"
+    )
+    return audio
+
+
+# ---------------------------------------------------------------------------
+# Token path: api.vk.com/method/audio.search
+# ---------------------------------------------------------------------------
 
 
 def _vk_call(method: str, **params: Any) -> dict | None:
-    """Synchronous VK API call. Returns the `response` dict on success,
-    None on error (already logged)."""
     if not VK_TOKEN:
         return None
     full_params = dict(params)
@@ -95,7 +178,7 @@ def _vk_call(method: str, **params: Any) -> dict | None:
         resp = requests.get(
             f"{_VK_API_BASE}/{method}",
             params=full_params,
-            headers={"User-Agent": _VK_UA},
+            headers={"User-Agent": _KATE_UA},
             timeout=10,
         )
     except requests.RequestException as e:
@@ -113,6 +196,15 @@ def _vk_call(method: str, **params: Any) -> dict | None:
     return data.get("response")
 
 
+# ---------------------------------------------------------------------------
+# Public surface
+# ---------------------------------------------------------------------------
+
+
+def is_configured() -> bool:
+    return bool(_audio_scraper) or bool(VK_TOKEN)
+
+
 def _to_track_meta(item: dict) -> TrackMeta:
     return TrackMeta(
         video_id=f"{item['owner_id']}_{item['id']}",
@@ -123,11 +215,21 @@ def _to_track_meta(item: dict) -> TrackMeta:
 
 
 def _search_blocking(query: str, limit: int) -> list[TrackMeta]:
+    if _audio_scraper is not None:
+        try:
+            results = list(islice(_audio_scraper.search(q=query, count=limit), limit))
+        except Exception:
+            log.exception("m.vk.com search failed for %r", query)
+            return []
+        log.info("vk cookies-search %r → %d items", query, len(results))
+        return [_to_track_meta(item) for item in results]
+
+    # Token fallback
     response = _vk_call("audio.search", q=query, count=limit, auto_complete=1)
     if response is None:
         return []
     items = response.get("items") or []
-    log.info("VK audio.search %r → %d items", query, len(items))
+    log.info("vk audio.search %r → %d items", query, len(items))
     return [_to_track_meta(item) for item in islice(items, limit)]
 
 
@@ -149,7 +251,19 @@ def _parse_video_id(video_id: str) -> tuple[int, int] | None:
 
 
 def _fetch_audio(owner_id: int, audio_id: int) -> dict | None:
-    """audio.getById refreshes URL — VK URLs expire after a few hours."""
+    if _audio_scraper is not None:
+        try:
+            item = _audio_scraper.get_audio_by_id(owner_id, audio_id)
+        except Exception:
+            log.exception("m.vk.com get_audio_by_id failed for %s_%s", owner_id, audio_id)
+            return None
+        if isinstance(item, dict):
+            return item
+        if isinstance(item, list) and item:
+            return item[0]
+        return None
+
+    # Token fallback
     response = _vk_call("audio.getById", audios=f"{owner_id}_{audio_id}")
     if response is None:
         return None
@@ -170,9 +284,6 @@ def _download_blocking(video_id: str) -> DownloadedTrack:
 
     url = item.get("url")
     if not url:
-        # Some tracks don't expose a URL even with Kate token (DRM /
-        # geo-restricted / removed). Caller will surface this as a generic
-        # download-failed message to the user.
         raise RuntimeError(f"VK audio has no playable URL: {video_id}")
 
     title = (item.get("title") or "").strip() or "Unknown"
@@ -235,10 +346,14 @@ def cleanup(path: Path) -> None:
         log.warning("Failed to remove file %s", path)
 
 
-# Module-load smoke test — confirms token presence and emits a hint that
-# audio.search will be tried. Actual API call happens lazily on first
-# search to avoid blocking startup on a slow VK request.
-if VK_TOKEN:
-    _diag(f"VK_TOKEN present ({len(VK_TOKEN)} chars), audio.search ready")
+# ---------------------------------------------------------------------------
+# Module-load init
+# ---------------------------------------------------------------------------
+
+_audio_scraper = _build_audio_scraper()
+if _audio_scraper is not None:
+    _diag("primary path: cookies-based m.vk.com scraping")
+elif VK_TOKEN:
+    _diag(f"primary path: api.vk.com/audio.search (VK_TOKEN, {len(VK_TOKEN)} chars)")
 else:
-    _diag("VK_TOKEN absent, vkmusic disabled")
+    _diag("no auth configured — vkmusic disabled")
