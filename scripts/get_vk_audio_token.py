@@ -36,36 +36,57 @@ except ImportError:
     print("This script needs `requests`. Run: pip install requests", file=sys.stderr)
     sys.exit(2)
 
-# Kate Mobile constants — public application identifiers, not secrets.
-KATE_CLIENT_ID = "2685278"
-KATE_CLIENT_SECRET = "lxhD8OD7dMsqtXIm5IUY"
-KATE_USER_AGENT = (
-    "KateMobileAndroid/56 lite-460 (Android 4.4.2; SDK 19; "
-    "x86; unknown Android SDK built for x86; en)"
-)
+# Public client identifiers for VK's official mobile apps + Kate Mobile.
+# Each one is its own rate-limit bucket — when one trips flood control
+# we cycle to the next, which usually lets us through.
+CLIENTS = [
+    {
+        "name": "VK iPhone",
+        "client_id": "3140623",
+        "client_secret": "VeWdmVclDCtn6ihuP1nt",
+        "user_agent": "VKAndroidApp/8.43-15705 (Android 14; SDK 34; arm64-v8a; samsung SM-S921B; en; 2400x1080)",
+    },
+    {
+        "name": "VK Android",
+        "client_id": "2274003",
+        "client_secret": "hHbZxrka2uZ6jB1inYsH",
+        "user_agent": "VKAndroidApp/8.43-15705 (Android 14; SDK 34; arm64-v8a; samsung SM-S921B; en; 2400x1080)",
+    },
+    {
+        "name": "Kate Mobile",
+        "client_id": "2685278",
+        "client_secret": "lxhD8OD7dMsqtXIm5IUY",
+        "user_agent": (
+            "KateMobileAndroid/56 lite-460 (Android 4.4.2; SDK 19; "
+            "x86; unknown Android SDK built for x86; en)"
+        ),
+    },
+]
 
 OAUTH_URL = "https://oauth.vk.com/token"
 
 
-def _post(params: dict, *, insecure: bool = False) -> dict:
+_INSECURE_TLS = False  # set once we discover the local cert chain is MITM'd
+
+
+def _post(params: dict, user_agent: str) -> dict:
     """POST to oauth.vk.com/token. Returns the JSON body even on non-2xx
     (the API uses 4xx with a JSON error body)."""
+    global _INSECURE_TLS
     try:
         r = requests.post(
             OAUTH_URL,
             data=params,
-            headers={"User-Agent": KATE_USER_AGENT},
+            headers={"User-Agent": user_agent},
             timeout=15,
-            verify=not insecure,
+            verify=not _INSECURE_TLS,
         )
     except requests.exceptions.SSLError:
-        if insecure:
+        if _INSECURE_TLS:
             raise
         print(
             "\n[!] SSL verification failed — likely an antivirus / corporate proxy is\n"
-            "    inspecting HTTPS (Kaspersky / ESET / Zscaler etc.). Retrying with\n"
-            "    cert verification disabled. Safe on your own machine for this\n"
-            "    one-shot auth.",
+            "    inspecting HTTPS. Retrying with cert verification disabled.",
             file=sys.stderr,
         )
         try:
@@ -73,15 +94,33 @@ def _post(params: dict, *, insecure: bool = False) -> dict:
             requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
         except ImportError:
             pass
-        return _post(params, insecure=True)
+        _INSECURE_TLS = True
+        return _post(params, user_agent)
     try:
         return r.json()
     except ValueError:
         raise RuntimeError(f"Non-JSON response from VK ({r.status_code}): {r.text[:200]}")
 
 
+def _try_login(client: dict, login: str, password: str, code: str | None) -> dict:
+    params = {
+        "grant_type": "password",
+        "client_id": client["client_id"],
+        "client_secret": client["client_secret"],
+        "username": login,
+        "password": password,
+        "scope": "audio,offline",
+        "2fa_supported": "1",
+        "force_sms": "1",
+        "v": "5.131",
+    }
+    if code:
+        params["code"] = code
+    return _post(params, client["user_agent"])
+
+
 def main() -> int:
-    print("VK audio token receiver — Kate Mobile direct-auth flow")
+    print("VK audio token receiver — direct-auth flow (with client rotation)")
     print("(your credentials stay local; only the resulting token is printed)\n")
 
     login = input("Login (phone or email): ").strip()
@@ -93,55 +132,62 @@ def main() -> int:
         print("Password is required.", file=sys.stderr)
         return 1
 
-    base_params = {
-        "grant_type": "password",
-        "client_id": KATE_CLIENT_ID,
-        "client_secret": KATE_CLIENT_SECRET,
-        "username": login,
-        "password": password,
-        "scope": "audio,offline",
-        "2fa_supported": "1",
-        "force_sms": "1",
-        "v": "5.131",
-    }
-
-    response = _post(base_params)
-
-    # If 2FA is on, VK responds with validation_type and validation_sid.
-    if response.get("error") == "need_validation":
-        print(f"\nTwo-factor required ({response.get('validation_type')}).")
-        if response.get("phone_mask"):
-            print(f"SMS sent to {response['phone_mask']}.")
-        code = input("Enter the SMS / authenticator code: ").strip()
-        if not code:
-            print("Code is required.", file=sys.stderr)
-            return 1
-        params2 = dict(base_params)
-        params2["code"] = code
-        response = _post(params2)
-
-    if response.get("error") == "need_captcha":
-        print(f"\nCAPTCHA required: {response.get('captcha_img')}", file=sys.stderr)
-        print("Open the URL above, solve the CAPTCHA, and paste the result.", file=sys.stderr)
-        captcha_key = input("CAPTCHA solution: ").strip()
-        params3 = dict(base_params)
-        params3["captcha_sid"] = response["captcha_sid"]
-        params3["captcha_key"] = captcha_key
-        response = _post(params3)
-
-    token = response.get("access_token")
-    if not token:
-        print(f"\nFailed to obtain token: {json.dumps(response, ensure_ascii=False, indent=2)}",
+    last_error: dict = {}
+    for client in CLIENTS:
+        print(f"\n→ Trying {client['name']} (client_id {client['client_id']})...",
               file=sys.stderr)
-        return 1
+        response = _try_login(client, login, password, code=None)
 
-    print("\n=== SUCCESS ===")
-    print(f"User ID: {response.get('user_id')}")
-    print(f"Expires in: {response.get('expires_in')} (0 = never)")
-    print(f"\nYour VK_TOKEN:\n{token}\n")
-    print("Set it as a Fly secret:")
-    print(f'  fly secrets set "VK_TOKEN={token}" -a musicbot-dgxowq')
-    return 0
+        # 2FA needed → ask for the code, retry once with same client.
+        if response.get("error") == "need_validation":
+            print(f"  Two-factor required ({response.get('validation_type')}).")
+            if response.get("phone_mask"):
+                print(f"  SMS sent to {response['phone_mask']}.")
+            code = input("  Enter the SMS / authenticator code: ").strip()
+            if code:
+                response = _try_login(client, login, password, code=code)
+
+        if response.get("error") == "need_captcha":
+            print(f"  CAPTCHA required: {response.get('captcha_img')}",
+                  file=sys.stderr)
+            captcha_key = input("  CAPTCHA solution: ").strip()
+            params = {
+                "grant_type": "password",
+                "client_id": client["client_id"],
+                "client_secret": client["client_secret"],
+                "username": login,
+                "password": password,
+                "scope": "audio,offline",
+                "v": "5.131",
+                "captcha_sid": response["captcha_sid"],
+                "captcha_key": captcha_key,
+            }
+            response = _post(params, client["user_agent"])
+
+        token = response.get("access_token")
+        if token:
+            print("\n=== SUCCESS ===")
+            print(f"Client used: {client['name']}")
+            print(f"User ID: {response.get('user_id')}")
+            print(f"Expires in: {response.get('expires_in')} (0 = never)")
+            print(f"\nYour VK_TOKEN:\n{token}\n")
+            print("Set it as a Fly secret:")
+            print(f'  fly secrets set "VK_TOKEN={token}" -a musicbot-dgxowq')
+            return 0
+
+        # Print a one-line summary then move on if it's a flood error;
+        # bail immediately on anything else (wrong password, blocked, etc).
+        err = response.get("error", "")
+        msg = response.get("error_description", "")
+        print(f"  {client['name']} failed: {err} — {msg[:120]}", file=sys.stderr)
+        last_error = response
+        if "flood" not in err.lower() and "bruteforce" not in response.get("error_type", "").lower():
+            # not a flood block — different clients won't help (e.g. invalid_client / wrong creds)
+            break
+
+    print(f"\nNo client worked. Last response:\n{json.dumps(last_error, ensure_ascii=False, indent=2)}",
+          file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":
