@@ -157,13 +157,33 @@ def _build_audio_scraper():
     session.lock = None  # not used by VkAudio
     session.api_version = _VK_API_VERSION
 
+    # Warmup: a vk.com session doesn't auto-share its session token with
+    # m.vk.com. The first request to m.vk.com/audio responds with a
+    # JSON redirect to login.vk.com?role=pda_frame, which is the bridge
+    # that exchanges our vk.com session for an m.vk.com one and bounces
+    # back. requests.get() follows that redirect chain and the resulting
+    # http.cookies jar then carries the m.vk.com session — subsequent
+    # AJAX search POSTs go through cleanly.
+    try:
+        warm = http.get(
+            "https://m.vk.com/audio", timeout=15, allow_redirects=True,
+        )
+        _diag(
+            f"warmup: status={warm.status_code}, final_url={warm.url}, "
+            f"cookies_after={len(http.cookies)}"
+        )
+        if "login" in warm.url:
+            _diag("warmup ended on login page — auth bridge didn't complete")
+    except Exception as e:
+        _diag(f"warmup failed: {e}")
+
     audio = VkAudio.__new__(VkAudio)
     audio._vk = session
     audio.user_id = user_id
     audio.convert_m3u8_links = True
     _diag(
-        f"VkAudio (cookies path) initialised: {len(cookies)} cookies, "
-        f"user_id={user_id}"
+        f"VkAudio (cookies path) initialised: {len(cookies)} cookies in, "
+        f"{len(http.cookies)} after warmup, user_id={user_id}"
     )
     return audio
 
