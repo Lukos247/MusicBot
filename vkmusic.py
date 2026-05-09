@@ -141,6 +141,11 @@ def _build_audio_scraper():
     http.headers.update({
         "User-Agent": _BROWSER_UA,
         "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+        # Without X-Requested-With m.vk.com returns the full HTML page
+        # instead of the al=1 AJAX JSON envelope vk_api expects to parse.
+        "X-Requested-With": "XMLHttpRequest",
+        "Origin": "https://m.vk.com",
+        "Referer": "https://m.vk.com/audio",
     })
 
     # vk_api.VkApi normally needs login/password or a token. We bypass
