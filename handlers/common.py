@@ -7,9 +7,9 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import FSInputFile, Message
 
 import cache
-import vkmusic
+import yandex_music_source as audio_source
 from config import STORAGE_CHAT_ID
-from vkmusic import FileTooLargeError
+from yandex_music_source import FileTooLargeError
 
 from . import _dedup as dedup
 
@@ -63,7 +63,7 @@ async def materialize_file_id(bot: Bot, video_id: str) -> cache.CachedTrack | No
 
     try:
         try:
-            track = await vkmusic.download(video_id)
+            track = await audio_source.download(video_id)
         except FileTooLargeError:
             raise
         except Exception:
@@ -80,12 +80,12 @@ async def materialize_file_id(bot: Bot, video_id: str) -> cache.CachedTrack | No
             )
         except Exception:
             log.exception("upload to STORAGE_CHAT_ID failed for %s", video_id)
-            vkmusic.cleanup(track.path)
+            audio_source.cleanup(track.path)
             return None
 
         if sent.audio is None:
             log.warning("STORAGE_CHAT_ID upload for %s returned no audio object", video_id)
-            vkmusic.cleanup(track.path)
+            audio_source.cleanup(track.path)
             return None
 
         await cache.save(
@@ -95,7 +95,7 @@ async def materialize_file_id(bot: Bot, video_id: str) -> cache.CachedTrack | No
             track.performer,
             track.duration,
         )
-        vkmusic.cleanup(track.path)
+        audio_source.cleanup(track.path)
         return await cache.get(video_id)
     finally:
         dedup.release(video_id, ev)

@@ -18,11 +18,11 @@ from aiogram.types import (
 )
 
 import cache
-import vkmusic
+import yandex_music_source as audio_source
 from config import INLINE_CACHE_TIME, INLINE_SEARCH_TIMEOUT, SEARCH_LIMIT_INLINE
 
 from .common import materialize_file_id
-from vkmusic import FileTooLargeError
+from yandex_music_source import FileTooLargeError
 
 router = Router(name="inline")
 log = logging.getLogger(__name__)
@@ -47,7 +47,7 @@ def _format_duration(seconds: int) -> str:
     return f"{m}:{s:02d}"
 
 
-def _make_article(t: vkmusic.TrackMeta) -> InlineQueryResultArticle:
+def _make_article(t: audio_source.TrackMeta) -> InlineQueryResultArticle:
     """Build an Article result for a non-cached track. The Article posts a
     text placeholder; the chosen_inline_result handler later edits it into
     audio via editMessageMedia.
@@ -116,11 +116,11 @@ async def on_inline_query(query: InlineQuery, bot: Bot) -> None:
         need = SEARCH_LIMIT_INLINE - len(cached_results)
         try:
             yt_tracks = await asyncio.wait_for(
-                vkmusic.search(text, SEARCH_LIMIT_INLINE),
+                audio_source.search(text, SEARCH_LIMIT_INLINE),
                 timeout=INLINE_SEARCH_TIMEOUT,
             )
         except asyncio.TimeoutError:
-            log.info("vkmusic.search timed out for %r", text)
+            log.info("audio_source.search timed out for %r", text)
             yt_tracks = []
         for t in yt_tracks:
             if t.video_id in cached_ids:

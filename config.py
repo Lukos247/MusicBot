@@ -31,13 +31,11 @@ if _storage_raw:
 else:
     STORAGE_CHAT_ID = _DEFAULT_STORAGE_CHAT_ID
 
-VK_TOKEN = os.getenv("VK_TOKEN", "").strip()
-# Browser-cookies path (preferred when password flow is flood-blocked).
-# VK_COOKIES_B64 = base64-encoded Netscape cookies.txt exported from a
-# logged-in vk.com browser session. VK_USER_ID = your numeric VK id
-# (visible at vk.com/edit — e.g. 79551234).
-VK_COOKIES_B64 = os.getenv("VK_COOKIES_B64", "").strip()
-VK_USER_ID = os.getenv("VK_USER_ID", "").strip()
+# Yandex.Music access token (OAuth implicit flow, requires Yandex Plus
+# subscription on the same account for streaming/download access).
+# Obtain via `python scripts/get_yandex_token.py` or by visiting
+# https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd418abb4b39c32c41195d
+YANDEX_TOKEN = os.getenv("YANDEX_TOKEN", "").strip()
 
 MAX_AUDIO_BYTES = 49 * 1024 * 1024
 SEARCH_LIMIT_DM = 5

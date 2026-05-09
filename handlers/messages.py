@@ -6,7 +6,7 @@ from aiogram import Bot, F, Router
 from aiogram.filters import CommandObject, CommandStart
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-import vkmusic
+import yandex_music_source as audio_source
 from config import SEARCH_LIMIT_DM
 
 from .common import deliver_track
@@ -15,7 +15,7 @@ router = Router(name="messages")
 log = logging.getLogger(__name__)
 
 
-def _format_button_label(track: vkmusic.TrackMeta) -> str:
+def _format_button_label(track: audio_source.TrackMeta) -> str:
     label = f"{track.performer} — {track.title}" if track.performer else track.title
     if track.duration:
         m, s = divmod(track.duration, 60)
@@ -25,7 +25,7 @@ def _format_button_label(track: vkmusic.TrackMeta) -> str:
     return label
 
 
-def _build_keyboard(tracks: list[vkmusic.TrackMeta]) -> InlineKeyboardMarkup:
+def _build_keyboard(tracks: list[audio_source.TrackMeta]) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text=_format_button_label(t), callback_data=f"pick:{t.video_id}")]
         for t in tracks
@@ -61,7 +61,7 @@ async def search_text(message: Message) -> None:
         return
 
     status = await message.answer("🔎 Ищу…")
-    tracks = await vkmusic.search(query, SEARCH_LIMIT_DM)
+    tracks = await audio_source.search(query, SEARCH_LIMIT_DM)
     if not tracks:
         await status.edit_text("Ничего не нашлось. Попробуй уточнить запрос.")
         return
