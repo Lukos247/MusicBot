@@ -214,12 +214,45 @@ def _to_track_meta(item: dict) -> TrackMeta:
     )
 
 
+def _probe_mvk_response(query: str) -> None:
+    """Hit m.vk.com/audio directly with the configured cookies and log
+    the raw shape so we can see what's actually wrong when vk_api crashes."""
+    if _audio_scraper is None:
+        return
+    http = _audio_scraper._vk.http
+    try:
+        r = http.post(
+            "https://m.vk.com/audio",
+            data={
+                "act": "section",
+                "al": 1,
+                "claim": 0,
+                "is_layer": 0,
+                "owner_id": _audio_scraper.user_id,
+                "section": "search",
+                "q": query,
+            },
+            timeout=15,
+            allow_redirects=False,
+        )
+    except Exception as e:
+        log.warning("m.vk.com probe network error: %s", e)
+        return
+    body = r.text or ""
+    head = body[:400].replace("\n", " ")
+    log.warning(
+        "m.vk.com probe: status=%s, final_url=%s, body_len=%d, head=%r",
+        r.status_code, r.url, len(body), head,
+    )
+
+
 def _search_blocking(query: str, limit: int) -> list[TrackMeta]:
     if _audio_scraper is not None:
         try:
             results = list(islice(_audio_scraper.search(q=query, count=limit), limit))
         except Exception:
             log.exception("m.vk.com search failed for %r", query)
+            _probe_mvk_response(query)
             return []
         log.info("vk cookies-search %r → %d items", query, len(results))
         return [_to_track_meta(item) for item in results]
