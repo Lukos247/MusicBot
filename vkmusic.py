@@ -138,14 +138,16 @@ def _build_audio_scraper():
     http = requests.Session()
     for name, value in cookies.items():
         http.cookies.set(name, value, domain=".vk.com", path="/")
+    # Phase 1 headers — plain browser-like, no AJAX marker. We need this
+    # for the warmup GET so m.vk.com performs an HTTP-level redirect to
+    # login.vk.com (which exchanges the vk.com session for an m.vk.com
+    # one). With X-Requested-With set the same call would respond with a
+    # JSON `{location: ...}` body and no actual redirect chain — meaning
+    # m.vk.com cookies would never get planted.
     http.headers.update({
         "User-Agent": _BROWSER_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
-        # Without X-Requested-With m.vk.com returns the full HTML page
-        # instead of the al=1 AJAX JSON envelope vk_api expects to parse.
-        "X-Requested-With": "XMLHttpRequest",
-        "Origin": "https://m.vk.com",
-        "Referer": "https://m.vk.com/audio",
     })
 
     # vk_api.VkApi normally needs login/password or a token. We bypass
@@ -158,24 +160,34 @@ def _build_audio_scraper():
     session.api_version = _VK_API_VERSION
 
     # Warmup: a vk.com session doesn't auto-share its session token with
-    # m.vk.com. The first request to m.vk.com/audio responds with a
-    # JSON redirect to login.vk.com?role=pda_frame, which is the bridge
-    # that exchanges our vk.com session for an m.vk.com one and bounces
-    # back. requests.get() follows that redirect chain and the resulting
-    # http.cookies jar then carries the m.vk.com session — subsequent
-    # AJAX search POSTs go through cleanly.
+    # m.vk.com. The first browser-like GET to m.vk.com/audio HTTP-302s
+    # to login.vk.com?role=pda_frame, which exchanges our vk.com session
+    # for an m.vk.com one and bounces back. requests' default
+    # follow-redirects rides that chain and the cookie jar afterwards
+    # carries the m.vk.com session.
+    cookies_before = len(http.cookies)
     try:
         warm = http.get(
             "https://m.vk.com/audio", timeout=15, allow_redirects=True,
         )
         _diag(
             f"warmup: status={warm.status_code}, final_url={warm.url}, "
-            f"cookies_after={len(http.cookies)}"
+            f"cookies {cookies_before} → {len(http.cookies)}, "
+            f"history={[h.status_code for h in warm.history]}"
         )
-        if "login" in warm.url:
-            _diag("warmup ended on login page — auth bridge didn't complete")
+        if "login" in warm.url and "login.vk.com" not in warm.url:
+            _diag("warmup ended on a login form — auth bridge didn't complete")
     except Exception as e:
         _diag(f"warmup failed: {e}")
+
+    # Phase 2 headers — now that the session is m.vk.com-authenticated,
+    # subsequent vk_api.audio.VkAudio POSTs need the AJAX markers so
+    # m.vk.com returns the JSON envelope rather than a full HTML page.
+    http.headers.update({
+        "X-Requested-With": "XMLHttpRequest",
+        "Origin": "https://m.vk.com",
+        "Referer": "https://m.vk.com/audio",
+    })
 
     audio = VkAudio.__new__(VkAudio)
     audio._vk = session
